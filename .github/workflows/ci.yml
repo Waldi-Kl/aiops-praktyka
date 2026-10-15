@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/ci.yml'
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-orders-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          working-directory: app/orders-api
+          enable-cache: true
+          cache-dependency-glob: |
+            app/orders-api/pyproject.toml
+            app/orders-api/uv.lock
+
+      - name: Run pytest
+        working-directory: app/orders-api
+        run: uv run pytest -q
+
+  test-payments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Deliberate deviation from `make test-payments` (which runs `go test` inside a
+      # throwaway `docker run golang:1.23` container with no cross-run cache). go.mod
+      # pins `go 1.23`, so this is functionally identical while actually benefiting
+      # from actions/setup-go's native module/build cache keyed on go.sum.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache: true
+          cache-dependency-path: app/payments/go.sum
+
+      - name: Run go test
+        working-directory: app/payments
+        run: go test ./...
+
+  build-push:
+    needs: [test-orders-api, test-payments]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        # Exactly the 4 app services that ship as images — NOT loadgen, NOT postgres.
+        service: [orders-api, payments, worker, web]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app/${{ matrix.service }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ vars.ECR_REGISTRY }}/kantyna/${{ matrix.service }}:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            APP_VARIANT=stable
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    needs: build-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region eu-central-1 --name aiops
+
+      # Pinned to v4.3.0 deliberately: this is newer than the Helm v3.22.0 documented
+      # for local/lab use in CLAUDE.md. Helm's release storage (a Kubernetes Secret) is
+      # compatible across v3/v4, so this is safe to mix with local v3 admin — do not
+      # "fix" this back to v3 to match CLAUDE.md.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: 'v4.3.0'
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: 'v1.36.3'
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade kantyna app/deploy/helm/kantyna \
+            --namespace "$K8S_NAMESPACE" \
+            --reuse-values \
+            --set global.imageRegistry="$ECR_REGISTRY" \
+            --set global.imageTag="$IMAGE_TAG" \
+            --timeout 5m
+
+      - name: Wait for rollouts
+        run: |
+          set -euo pipefail
+          for d in orders-api payments worker web; do
+            kubectl rollout status "deployment/kantyna-$d" \
+              -n "$K8S_NAMESPACE" --timeout=120s
+          done
+
+      - name: Smoke test /healthz
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # worker has no /healthz route (only /metrics on 9000) — its health is
+          # already gated by the rollout-status TCP readinessProbe check above.
+          for target in \
+            "orders-api:http://kantyna-orders-api:8000/healthz" \
+            "payments:http://kantyna-payments:8080/healthz" \
+            "web:http://kantyna-web:8080/healthz"
+          do
+            name="${target%%:*}"
+            url="${target#*:}"
+            kubectl run "smoke-$name-$RUN_ID" \
+              --image=curlimages/curl@sha256:ce8e655b562cf387752de7d2076ec3f81a4383c908f386b6724ec3571ce08b4a \
+              --restart=Never -i --rm \
+              -n "$K8S_NAMESPACE" \
+              --command -- curl -fsS --max-time 5 "$url"
+          done
+
+  lint-workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:9d36088643581e728c969f35141f88139fec77280b2be23c1f66f8e40e1025e7 # 1.7.12
+        with:
+          args: -color
+
+      - uses: zizmorcore/zizmor-action@f9597c869b2e67095f9b527070297a13a6efe928 # v0.7.0
+        with:
+          inputs: .github/workflows/ci.yml
+          advanced-security: "false"
+          annotations: "true"

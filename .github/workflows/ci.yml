@@ -168,6 +168,9 @@ jobs:
           set -euo pipefail
           # worker has no /healthz route (only /metrics on 9000) — its health is
           # already gated by the rollout-status TCP readinessProbe check above.
+          # The smoke pod is labeled app.kubernetes.io/name=web so NetworkPolicy
+          # kantyna-orders-api-ingress (ingress to orders-api allowed only from pods
+          # labeled "web") lets it through, the same way it allows the real web pods.
           for target in \
             "orders-api:http://kantyna-orders-api:8000/healthz" \
             "payments:http://kantyna-payments:8080/healthz" \
@@ -176,6 +179,7 @@ jobs:
             name="${target%%:*}"
             url="${target#*:}"
             kubectl run "smoke-$name-$RUN_ID" \
+              --labels="app.kubernetes.io/name=web" \
               --image=curlimages/curl@sha256:ce8e655b562cf387752de7d2076ec3f81a4383c908f386b6724ec3571ce08b4a \
               --restart=Never -i --rm \
               -n "$K8S_NAMESPACE" \

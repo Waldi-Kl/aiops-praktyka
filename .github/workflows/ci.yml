@@ -33,8 +33,8 @@ jobs:
           working-directory: app/orders-api
           enable-cache: true
           cache-dependency-glob: |
-            app/orders-api/pyproject.toml
-            app/orders-api/uv.lock
+            pyproject.toml
+            uv.lock
 
       - name: Run pytest
         working-directory: app/orders-api
@@ -139,6 +139,10 @@ jobs:
         with:
           version: 'v1.36.3'
 
+      # --force-conflicts: Helm v4 defaults to server-side apply, and fields touched
+      # earlier by manual `kubectl set`/`kubectl patch` (e.g. during lab02 debugging)
+      # are owned by a different field manager. Without this flag, helm upgrade fails
+      # with "conflict ... using apps/v1: ... Apply failed with 1 conflict".
       - name: Helm upgrade
         run: |
           helm upgrade kantyna app/deploy/helm/kantyna \
@@ -146,6 +150,7 @@ jobs:
             --reuse-values \
             --set global.imageRegistry="$ECR_REGISTRY" \
             --set global.imageTag="$IMAGE_TAG" \
+            --force-conflicts \
             --timeout 5m
 
       - name: Wait for rollouts
